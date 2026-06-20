@@ -101,9 +101,9 @@ CACHE_TTL_SECONDS=3600
 ### Already built (working, tested)
 - [✅] Docker Compose stack boots (api + db + cache)
 - [✅] FastAPI skeleton + health check
-- [ ] SQLAlchemy models + Alembic migration
-- [ ] POST /shorten endpoint
-- [ ] GET /{code} redirect endpoint
+- [✅] SQLAlchemy models + Alembic migration
+- [✅] POST /shorten endpoint
+- [✅] GET /{code} redirect endpoint
 - [ ] Redis cache on redirect
 - [ ] Rate limiter
 - [ ] Async click tracking

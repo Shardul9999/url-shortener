@@ -1,25 +1,38 @@
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import redis.asyncio as redis
+
+from app.cache import get_redis
+from app.config import settings
 from app.database import get_db
 from app.models import Url
 from app.schemas import ShortenRequest, ShortenResponse
 from app.services.shortener import generate_short_code
-from app.config import settings
+from app.services.ratelimit import is_allowed
 
 router = APIRouter()
 
 
 @router.post("/shorten", response_model=ShortenResponse, status_code=201)
 async def shorten_url(
+    request: Request,
     payload: ShortenRequest,
     db: AsyncSession = Depends(get_db),
+    cache: redis.Redis = Depends(get_redis),
 ) -> ShortenResponse:
+    ip = request.client.host
+    if not await is_allowed(cache, f"ratelimit:{ip}", settings.RATE_LIMIT_PER_MINUTE, 60):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Try again later.",
+            headers={"Retry-After": "60"},
+        )
     expires_at = None
     if payload.expires_in_hours is not None:
         expires_at = datetime.now(timezone.utc) + timedelta(hours=payload.expires_in_hours)
@@ -50,7 +63,14 @@ async def shorten_url(
 async def redirect_url(
     short_code: str,
     db: AsyncSession = Depends(get_db),
+    cache: redis.Redis = Depends(get_redis),
 ) -> RedirectResponse:
+    cache_key = f"url:{short_code}"
+
+    cached = await cache.get(cache_key)
+    if cached:
+        return RedirectResponse(cached, status_code=302)
+
     result = await db.execute(select(Url).where(Url.short_code == short_code))
     url = result.scalar_one_or_none()
 
@@ -60,4 +80,5 @@ async def redirect_url(
     if url.expires_at is not None and url.expires_at < datetime.now(timezone.utc):
         raise HTTPException(status_code=404, detail="Short URL has expired.")
 
+    await cache.set(cache_key, url.original_url, ex=settings.CACHE_TTL_SECONDS)
     return RedirectResponse(url.original_url, status_code=302)
