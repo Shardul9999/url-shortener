@@ -99,8 +99,8 @@ CACHE_TTL_SECONDS=3600
 ## SESSION STATE (update this section every session — this is what changes)
 
 ### Already built (working, tested)
-- [ ] Docker Compose stack boots (api + db + cache)
-- [ ] FastAPI skeleton + health check
+- [✅] Docker Compose stack boots (api + db + cache)
+- [✅] FastAPI skeleton + health check
 - [ ] SQLAlchemy models + Alembic migration
 - [ ] POST /shorten endpoint
 - [ ] GET /{code} redirect endpoint
