@@ -27,7 +27,9 @@ async def shorten_url(
     cache: redis.Redis = Depends(get_redis),
 ) -> ShortenResponse:
     ip = request.client.host
-    if not await is_allowed(cache, f"ratelimit:{ip}", settings.RATE_LIMIT_PER_MINUTE, 60):
+    if not await is_allowed(
+        cache, f"ratelimit:{ip}", settings.RATE_LIMIT_PER_MINUTE, 60
+    ):
         raise HTTPException(
             status_code=429,
             detail="Rate limit exceeded. Try again later.",
@@ -35,7 +37,9 @@ async def shorten_url(
         )
     expires_at = None
     if payload.expires_in_hours is not None:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=payload.expires_in_hours)
+        expires_at = datetime.now(timezone.utc) + timedelta(
+            hours=payload.expires_in_hours
+        )
 
     for _ in range(5):
         code = generate_short_code()
@@ -56,7 +60,9 @@ async def shorten_url(
         except IntegrityError:
             await db.rollback()
 
-    raise HTTPException(status_code=500, detail="Could not generate a unique short code. Try again.")
+    raise HTTPException(
+        status_code=500, detail="Could not generate a unique short code. Try again."
+    )
 
 
 @router.get("/{short_code}")
