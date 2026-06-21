@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: urlshortener
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      cache:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@localhost:5432/urlshortener
+      REDIS_URL: redis://localhost:6379/0
+      SECRET_KEY: ci-secret-key
+      BASE_URL: http://localhost:8000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install black mypy
+
+      - name: Create test database
+        run: psql postgresql://postgres:password@localhost:5432/postgres -c "CREATE DATABASE urlshortener_test;"
+
+      - name: Run pytest
+        run: pytest tests/ -v
+
+      - name: Check formatting (black)
+        run: black --check app/
+
+      - name: Type check (mypy)
+        run: mypy app/ --ignore-missing-imports
+        continue-on-error: true
