@@ -70,3 +70,30 @@ async def test_redirect_expired_url_returns_404(client: AsyncClient):
 
     response = await client.get(f"/{code}", follow_redirects=False)
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/{short_code}
+# ---------------------------------------------------------------------------
+
+
+async def test_analytics_returns_url_data(client: AsyncClient):
+    """Analytics for a freshly created URL returns correct fields and zero clicks."""
+    body = await _shorten(client)
+    code = body["short_code"]
+
+    response = await client.get(f"/analytics/{code}")
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["short_code"] == code
+    assert data["original_url"] == "https://example.com/"
+    assert data["click_count"] == 0
+    assert data["recent_clicks"] == []
+    assert "created_at" in data
+    assert data["expires_at"] is None
+
+
+async def test_analytics_nonexistent_code_returns_404(client: AsyncClient):
+    response = await client.get("/analytics/doesnotexist")
+    assert response.status_code == 404

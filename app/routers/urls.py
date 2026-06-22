@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -10,13 +10,36 @@ import redis.asyncio as redis
 
 from app.cache import get_redis
 from app.config import settings
-from app.database import get_db
-from app.models import Url
+from app.database import get_db, AsyncSessionLocal
+from app.models import Click, Url
 from app.schemas import ShortenRequest, ShortenResponse
 from app.services.shortener import generate_short_code
 from app.services.ratelimit import is_allowed
 
 router = APIRouter()
+
+
+async def _record_click(
+    short_code: str, referrer: str | None, ip_address: str | None
+) -> None:
+    """Insert a Click row and increment url.click_count after the response is sent.
+
+    Wrapped in try/except so a DB hiccup never breaks the redirect response.
+    """
+    try:
+        async with AsyncSessionLocal() as session:
+            session.add(
+                Click(short_code=short_code, referrer=referrer, ip_address=ip_address)
+            )
+            result = await session.execute(
+                select(Url).where(Url.short_code == short_code)
+            )
+            url = result.scalar_one_or_none()
+            if url is not None:
+                url.click_count += 1
+            await session.commit()
+    except Exception:
+        pass
 
 
 @router.post("/shorten", response_model=ShortenResponse, status_code=201)
@@ -68,13 +91,18 @@ async def shorten_url(
 @router.get("/{short_code}")
 async def redirect_url(
     short_code: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     cache: redis.Redis = Depends(get_redis),
 ) -> RedirectResponse:
+    referrer = request.headers.get("referer")
+    ip = request.client.host
     cache_key = f"url:{short_code}"
 
     cached = await cache.get(cache_key)
     if cached:
+        background_tasks.add_task(_record_click, short_code, referrer, ip)
         return RedirectResponse(cached, status_code=302)
 
     result = await db.execute(select(Url).where(Url.short_code == short_code))
@@ -87,4 +115,5 @@ async def redirect_url(
         raise HTTPException(status_code=404, detail="Short URL has expired.")
 
     await cache.set(cache_key, url.original_url, ex=settings.CACHE_TTL_SECONDS)
+    background_tasks.add_task(_record_click, short_code, referrer, ip)
     return RedirectResponse(url.original_url, status_code=302)

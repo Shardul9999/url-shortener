@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import urls
+from app.routers import analytics, urls
 
 app = FastAPI()
 
@@ -11,3 +11,4 @@ async def health_check() -> dict:
 
 
 app.include_router(urls.router)
+app.include_router(analytics.router)

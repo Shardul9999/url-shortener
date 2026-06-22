@@ -3,11 +3,12 @@ import pytest_asyncio
 import redis.asyncio as redis
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.pool import NullPool
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
 from app.main import app
 from app.database import Base, get_db
 from app.cache import get_redis
+import app.routers.urls as urls_module
 
 TEST_DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost:5432/urlshortener_test"
 TEST_REDIS_URL = "redis://localhost:6379/1"  # index 1 — separate from dev (index 0)
@@ -60,7 +61,9 @@ async def redis_client() -> redis.Redis:
 
 
 # ---------------------------------------------------------------------------
-# HTTP test client — dependency overrides point to test DB and test Redis
+# HTTP test client — dependency overrides point to test DB and test Redis.
+# Also patches AsyncSessionLocal used by the _record_click background task
+# so click tracking writes hit the test database instead of the Docker host.
 # ---------------------------------------------------------------------------
 @pytest_asyncio.fixture()
 async def client(db_session: AsyncSession, redis_client: redis.Redis) -> AsyncClient:
@@ -73,10 +76,16 @@ async def client(db_session: AsyncSession, redis_client: redis.Redis) -> AsyncCl
     app.dependency_overrides[get_db] = _override_get_db
     app.dependency_overrides[get_redis] = _override_get_redis
 
+    # Patch the session factory used by _record_click background task
+    _test_session_factory = async_sessionmaker(_test_engine, expire_on_commit=False)
+    original_session_local = urls_module.AsyncSessionLocal
+    urls_module.AsyncSessionLocal = _test_session_factory
+
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as ac:
         yield ac
 
+    urls_module.AsyncSessionLocal = original_session_local
     app.dependency_overrides.clear()

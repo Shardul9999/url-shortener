@@ -108,8 +108,8 @@ CACHE_TTL_SECONDS=3600
 - [✅] Rate limiter
 - [ ] Async click tracking
 - [ ] GET /analytics/{code}
-- [ ] Tests
-- [ ] CI pipeline
+- [✅] Tests
+- [✅] CI pipeline
 - [ ] Deployed
 
 ### Current task (fill this in right now, every session)
