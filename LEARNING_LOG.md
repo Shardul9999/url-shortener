@@ -354,3 +354,182 @@ return 0       -- block
 **Don't put raw milliseconds without context** — they depend on hardware, network, and load. The mechanism + ratio is what interviewers evaluate. If asked, you can mention your local Docker measurements as a baseline.
 
 ---
+
+## Session 3 — Tests, CI Pipeline, GitHub Actions
+
+### Files created / modified
+`tests/conftest.py` (new) · `tests/test_urls.py` (new) · `tests/test_ratelimit.py` (new) · `pytest.ini` (new) · `.github/workflows/ci.yml` (new)
+
+---
+
+### 1. pytest fixtures — scope and isolation
+
+**What we did:** Wrote three types of fixtures in `conftest.py`:
+- `create_test_tables` — session-scoped, runs DDL once before all tests
+- `db_session` — function-scoped, gives each test a clean DB state
+- `redis_client` — function-scoped, flushes Redis before each test
+- `client` — function-scoped, httpx test client with dependency overrides
+
+**Fixture scopes:**
+
+| Scope | Created | Destroyed | Use for |
+|---|---|---|---|
+| `session` | Once before all tests | After all tests | Expensive setup (DB schema) |
+| `module` | Once per file | After file | Shared state within a file |
+| `function` | Before each test | After each test | Clean isolation per test |
+
+**Why function-scoped DB session matters:** If one test inserts data and doesn't clean up, the next test sees stale data and may pass or fail for the wrong reason. Every test must start with a known, clean state.
+
+**Interview angle:** "How do you isolate tests that touch a database?" → Function-scoped fixtures with rollback or truncation. Each test gets a fresh slate — no order dependency between tests.
+
+---
+
+### 2. Transaction rollback vs truncation for test isolation
+
+**What we did:** Used `AsyncSession(bind=conn, join_transaction_mode="create_savepoint")` — wraps each test in an outer transaction, app-level commits land on savepoints, everything rolls back after the test.
+
+**How it works:**
+```
+Test starts → BEGIN (outer transaction)
+  App does INSERT + COMMIT → SAVEPOINT released (data visible within test)
+  App does INSERT + COMMIT → SAVEPOINT released
+Test ends   → ROLLBACK (all inserts gone, DB clean for next test)
+```
+
+**Why savepoints:** Without `join_transaction_mode="create_savepoint"`, the app's `session.commit()` would commit the outer transaction for real, and rollback wouldn't undo it. Savepoints let the app think it's committing while the outer transaction remains open.
+
+**Alternative — TRUNCATE:** Simpler but slower. Deletes all rows after each test with a real DELETE/TRUNCATE + commit. Fine for small suites, but adds real DB round-trips.
+
+**Interview angle:** "How do you roll back test data without deleting it manually?" → Wrap in a transaction, use savepoints for inner commits, rollback the outer transaction at teardown.
+
+---
+
+### 3. NullPool — the asyncio event loop gotcha
+
+**Bug hit:** Tests failed with `Future attached to a different loop` and `cannot perform operation: another operation is in progress`.
+
+**Root cause:** By default, SQLAlchemy uses a connection pool. A connection established in the session-scoped fixture's event loop gets pooled. When a function-scoped test runs in its *own* event loop (pytest-asyncio default) and tries to borrow that pooled connection, asyncpg refuses — the connection belongs to a different loop.
+
+**Fix — one line:**
+```python
+_test_engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+```
+
+`NullPool` means every `connect()` creates a brand new connection in the current loop, and every `close()` destroys it immediately. Nothing is ever pooled or reused across loops.
+
+**When to use NullPool:** Tests and migration scripts — any place that runs short-lived, one-shot processes. Never in production — creating a new TCP connection per request would kill performance.
+
+**Interview angle:** "Why does asyncpg throw 'Future attached to a different loop'?" → A connection was created in one asyncio event loop and used in another. asyncpg connections are loop-bound. Fix with NullPool in tests or ensure a shared loop.
+
+---
+
+### 4. FastAPI dependency overrides — how test clients swap real deps
+
+**What we did:** Used `app.dependency_overrides` to replace production `get_db` and `get_redis` with functions that yield the test fixtures.
+
+```python
+app.dependency_overrides[get_db] = lambda: (yield db_session)
+app.dependency_overrides[get_redis] = lambda: (yield redis_client)
+```
+
+**Why this is the right pattern:**
+- The app code (`urls.py`) never knows it's in a test — it calls `Depends(get_db)` and gets whatever the override returns.
+- No monkeypatching, no mocking, no changing production code to be testable.
+- `app.dependency_overrides.clear()` at teardown ensures overrides don't bleed into other tests.
+
+**`ASGITransport`:** Lets httpx drive FastAPI in-process without binding a real port. No network stack, no OS ports, tests run faster.
+
+**Interview angle:** "How do you test FastAPI endpoints without hitting a real database?" → `dependency_overrides` to inject a test session, `ASGITransport` to drive the app in-process.
+
+---
+
+### 5. What to test and what not to test
+
+**Happy path tests** — does the feature work as intended?
+- `POST /shorten` returns 201 with a valid short_code ✓
+- `GET /{code}` returns 302 to the original URL ✓
+
+**Failure path tests** — does it fail correctly?
+- `GET /nonexistent` returns 404 ✓
+- `GET /expired` returns 404 ✓
+
+**Cache behaviour tests** — does the caching logic actually run?
+- First request: cache miss, DB hit, Redis key written ✓
+- Second request: cache hit, no DB ✓ (verified by asserting Redis key exists)
+
+**Unit vs integration tests:**
+- `test_ratelimit.py::test_allows_up_to_limit` — unit test, calls `is_allowed()` directly
+- `test_ratelimit.py::test_shorten_returns_429_after_rate_limit` — integration test, goes through HTTP
+
+Both are needed. Unit tests are fast and pinpoint failures. Integration tests catch wiring bugs (e.g., the dependency not being injected correctly).
+
+**Interview angle:** "What's the difference between a unit test and an integration test?" → Unit tests a single function in isolation. Integration test exercises multiple components working together (HTTP layer + business logic + DB + cache).
+
+---
+
+### 6. CI with GitHub Actions — what each piece does
+
+**What we built:** `.github/workflows/ci.yml` — runs automatically on every push and PR to `main`.
+
+**Service containers:** Postgres and Redis run as Docker sidecars on the same GitHub Actions runner. They're available at `localhost` via port mapping — same as running `docker compose up` locally, but fully automated.
+
+**Health checks on services:**
+```yaml
+options: >-
+  --health-cmd "pg_isready -U postgres"
+  --health-interval 5s
+  --health-retries 10
+```
+Without health checks, the `Run pytest` step starts before Postgres is ready to accept connections and immediately fails with "connection refused." Health checks make GitHub wait until the service is truly ready.
+
+**Hard gate vs soft gate:**
+- `pytest` — no `continue-on-error`. Fails = workflow fails = PR blocked. Hard gate.
+- `mypy` — `continue-on-error: true`. Runs, shows output, but never blocks a merge. Soft gate.
+
+**Why mypy is soft here:** mypy can be overly strict with newer SQLAlchemy/asyncpg async patterns that don't yet have complete type stubs. Making it soft lets you see the output without being blocked. As the ecosystem matures you remove the flag.
+
+**Interview angle:** "What does your CI pipeline check?" → Tests (hard gate), formatting (hard gate), types (soft gate). Explain why each is hard or soft — shows you thought about the tradeoffs.
+
+---
+
+### 7. Black — code formatting and why CI enforces it
+
+**What black does:** Reformats Python code to a single consistent style. No configuration, no debates — it just decides. Lines > 88 chars get wrapped, spacing is normalised.
+
+**Why we failed CI:** `black --check` doesn't reformat — it exits with code 1 if any file *would* be reformatted. Our code had long lines that black wanted to wrap (e.g., long `mapped_column()` calls in `models.py`).
+
+**Why CI enforces formatting, not just tests:**
+- Tests check if the code *works*. Formatting checks if the code *reads consistently*.
+- On a team, unformatted code creates noisy diffs — every PR has formatting changes mixed with logic changes.
+- Enforcing it in CI means no one has to argue about style in code review.
+
+**The fix:** Run `black app/` locally before pushing — it auto-reformats in place. Then commit the reformatted files.
+
+**Interview angle:** "Do you use any linters or formatters?" → Black for formatting (zero-config, opinionated), optionally ruff for linting. CI enforces both so style is never a code review discussion.
+
+---
+
+### 8. CI vs CD — when each runs
+
+**CI (what we built):** Runs on every push and PR. Checks that the code is correct before it merges.
+
+**CD (what comes next):** Runs after code merges to `main`. Ships the code to users.
+
+```
+Push code → CI runs (tests, lint) → PR merges → CD runs (build, deploy)
+```
+
+**CD in GitHub Actions** would be a second job with `if: github.ref == 'refs/heads/main'`:
+```yaml
+- name: Build and push Docker image
+- name: Deploy to server
+- name: Run alembic upgrade head
+```
+
+**Continuous Delivery vs Continuous Deployment:**
+- Delivery: code is automatically *ready* to ship, but a human clicks deploy
+- Deployment: fully automatic, no human step
+
+**Interview angle:** "What's the difference between CI and CD?" → CI validates code before merge. CD ships code after merge. CI is about correctness; CD is about delivery speed.
+
+---
