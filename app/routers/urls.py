@@ -98,6 +98,16 @@ async def redirect_url(
 ) -> RedirectResponse:
     referrer = request.headers.get("referer")
     ip = request.client.host
+
+    if not await is_allowed(
+        cache, f"ratelimit:redirect:{ip}", settings.REDIRECT_RATE_LIMIT_PER_MINUTE, 60
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Try again later.",
+            headers={"Retry-After": "60"},
+        )
+
     cache_key = f"url:{short_code}"
 
     cached = await cache.get(cache_key)

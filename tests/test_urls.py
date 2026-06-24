@@ -97,3 +97,35 @@ async def test_analytics_returns_url_data(client: AsyncClient):
 async def test_analytics_nonexistent_code_returns_404(client: AsyncClient):
     response = await client.get("/analytics/doesnotexist")
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /shorten — URL validation (SSRF / scheme rejection)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_url", [
+    "http://localhost/admin",
+    "http://127.0.0.1/secret",
+    "http://10.0.0.1/internal",
+    "http://192.168.1.1/router",
+    "http://172.16.0.1/private",
+    "http://[::1]/loopback",
+    # scheme rejection — AnyHttpUrl rejects non-http/https before the validator runs
+    "javascript:alert(1)",
+    # localhost with explicit port
+    "http://localhost:8000/admin",
+    # cloud metadata endpoint (link-local range 169.254.0.0/16)
+    "http://169.254.169.254/",
+])
+async def test_shorten_rejects_dangerous_urls(client: AsyncClient, bad_url: str):
+    response = await client.post("/shorten", json={"original_url": bad_url})
+    assert response.status_code == 422
+
+
+async def test_shorten_accepts_legitimate_https_url(client: AsyncClient):
+    """A normal public https:// URL must still be accepted."""
+    response = await client.post("/shorten", json={"original_url": "https://github.com/user/repo"})
+    assert response.status_code == 201
+    data = response.json()
+    assert data["original_url"] == "https://github.com/user/repo"
+    assert len(data["short_code"]) == 6

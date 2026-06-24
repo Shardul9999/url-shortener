@@ -106,8 +106,8 @@ CACHE_TTL_SECONDS=3600
 - [✅] GET /{code} redirect endpoint
 - [✅] Redis cache on redirect
 - [✅] Rate limiter
-- [ ] Async click tracking
-- [ ] GET /analytics/{code}
+- [✅] Async click tracking
+- [✅] GET /analytics/{code}
 - [✅] Tests
 - [✅] CI pipeline
 - [ ] Deployed

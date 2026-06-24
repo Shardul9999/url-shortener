@@ -68,3 +68,23 @@ async def test_shorten_returns_429_after_rate_limit(client: AsyncClient):
     response = await client.post("/shorten", json=payload)
     assert response.status_code == 429
     assert response.headers.get("retry-after") == "60"
+
+
+async def test_redirect_returns_429_after_rate_limit(client: AsyncClient):
+    """
+    Fire REDIRECT_RATE_LIMIT_PER_MINUTE + 1 GET /{code} requests.
+    The one past the limit should be 429.
+    """
+    # Create a URL to redirect to
+    post = await client.post("/shorten", json={"original_url": "https://example.com"})
+    assert post.status_code == 201
+    code = post.json()["short_code"]
+
+    limit = settings.REDIRECT_RATE_LIMIT_PER_MINUTE
+    for i in range(limit):
+        r = await client.get(f"/{code}", follow_redirects=False)
+        assert r.status_code == 302, f"Expected 302 on request {i + 1}, got {r.status_code}"
+
+    r = await client.get(f"/{code}", follow_redirects=False)
+    assert r.status_code == 429
+    assert r.headers.get("retry-after") == "60"

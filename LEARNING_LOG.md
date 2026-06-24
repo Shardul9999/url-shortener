@@ -533,3 +533,181 @@ Push code → CI runs (tests, lint) → PR merges → CD runs (build, deploy)
 **Interview angle:** "What's the difference between CI and CD?" → CI validates code before merge. CD ships code after merge. CI is about correctness; CD is about delivery speed.
 
 ---
+
+## Session 4 — Async Click Tracking, Analytics Endpoint, Coverage Fixes
+
+### Files created / modified
+`app/routers/urls.py` (BackgroundTasks + `_record_click`) · `app/routers/analytics.py` (new) · `app/schemas.py` (ClickOut, AnalyticsResponse) · `app/main.py` (analytics router wired) · `tests/conftest.py` (AsyncSessionLocal patch) · `tests/test_urls.py` (analytics tests) · `.coveragerc` (new)
+
+---
+
+### 1. FastAPI BackgroundTasks — fire-and-forget after the response
+
+**What we did:** After returning the `RedirectResponse`, FastAPI fires `_record_click` as a background task — it inserts a `Click` row and increments `url.click_count` without adding latency to the redirect itself.
+
+```python
+@router.get("/{short_code}")
+async def redirect_url(
+    short_code: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    ...
+) -> RedirectResponse:
+    ...
+    background_tasks.add_task(_record_click, short_code, referrer, ip)
+    return RedirectResponse(url.original_url, status_code=302)
+```
+
+**How it works in ASGI:**
+```
+Client sends GET /{code}
+  → handler builds RedirectResponse
+  → ASGI sends response headers + body to client
+  → background tasks run (after client already has the response)
+  → _record_click inserts Click row, increments click_count
+```
+
+**Why not just do it in the handler:**
+- Click tracking is analytics — it has no effect on whether the redirect succeeds.
+- Adding a DB write in the hot path adds ~5–10ms to every redirect.
+- If the analytics write fails, the redirect should still have worked. Decoupling removes that dependency.
+
+**Why try/except inside `_record_click`:**
+- A background task exception can propagate through the ASGI lifecycle and crash the test client or log as an unhandled error in production.
+- Click tracking is best-effort — a missed click is acceptable, a broken redirect is not.
+- Wrapping in `try/except Exception: pass` makes it truly fire-and-forget.
+
+**Interview angle:** "How do you do work after returning a response in FastAPI?" → `BackgroundTasks`. Injected as a parameter like any other dependency. Starlette runs them after the response body is sent. For heavier workloads, you'd use a task queue (Celery, ARQ) instead.
+
+---
+
+### 2. Why `_record_click` opens its own session (not the request session)
+
+**What we did:** `_record_click` calls `async with AsyncSessionLocal() as session:` to create a **fresh, independent** DB session.
+
+**Why not reuse the request's `db` session:**
+- FastAPI's `get_db` dependency is a generator tied to the request lifecycle — when the request ends (i.e., when the response is sent), the session is closed.
+- Background tasks run *after* the response is sent, which means *after* the request session is closed.
+- Using a closed session raises `InvalidRequestError`. The only correct option is a new session.
+
+**Trade-off:** The background task's session is independent — it has no visibility into uncommitted data from the request session. For click tracking this is fine (the URL already exists in the DB before the redirect runs).
+
+**Interview angle:** "Can a background task reuse the request's database session?" → No. By the time background tasks run, the request is finished and the session is closed. Always open a new session inside a background task.
+
+---
+
+### 3. Analytics endpoint — what to return and why
+
+**Schema design:**
+```python
+class AnalyticsResponse(BaseModel):
+    short_code: str
+    original_url: str
+    click_count: int          # from urls table (denormalized counter)
+    created_at: datetime
+    expires_at: datetime | None
+    recent_clicks: list[ClickOut]  # last 10 clicks from clicks table
+```
+
+**Why keep `click_count` on the `urls` table AND a separate `clicks` table:**
+- `click_count` is a denormalized counter — updated by `_record_click` in the background task. Gives instant O(1) total count without a `COUNT(*)` query on the clicks table.
+- The `clicks` table stores individual click events (timestamp, referrer, IP). Needed for time-series analytics, referrer breakdown, etc.
+- The two are eventually consistent — `click_count` may lag by one if the background task hasn't run yet, but that's acceptable for analytics.
+
+**Why `.limit(10)` on the clicks query:**
+- The `clicks` table grows unboundedly — a popular URL could have millions of rows.
+- Never `SELECT *` from an unbounded table. Always paginate or limit.
+
+**Interview angle:** "How would you add pagination to the analytics endpoint?" → Add `offset: int = 0` and `limit: int = 10` as query params, pass them to `.offset(offset).limit(limit)`. Return total count separately.
+
+---
+
+### 4. Coverage dropped after adding new code — what it means and what to do
+
+**What happened:** After adding `analytics.py` and the background task path in `urls.py`, overall coverage dropped from 94% to 89% because new lines were added that no existing test exercised.
+
+**Rule:** Coverage can only stay the same or go up if you write tests alongside new code. Adding untested code always drops the percentage.
+
+**What we tested:**
+- `test_analytics_returns_url_data` — happy path: creates a URL, checks analytics returns correct fields, zero clicks
+- `test_analytics_nonexistent_code_returns_404` — failure path: unknown code → 404
+
+**What we didn't test in unit tests (and why it's OK):**
+- `click_count` actually incrementing after a redirect — the background task opens its own session which can't see the test's uncommitted transaction (see topic 5 below). This is an inherent limitation of the savepoint isolation pattern. Integration tests (running against Docker) cover this.
+
+---
+
+### 5. Background tasks bypass dependency overrides — the AsyncSessionLocal patch
+
+**The bug:** `test_redirect_cache_hit` started failing after adding `_record_click`. The background task called `AsyncSessionLocal()` which uses `settings.DATABASE_URL` — the Docker hostname `db:5432` — which doesn't resolve from the host machine.
+
+**Why dependency overrides don't help:**
+- `app.dependency_overrides[get_db]` only intercepts calls that go through FastAPI's `Depends()` system.
+- `_record_click` calls `AsyncSessionLocal()` directly — it completely bypasses the dependency injection system. No override can intercept it.
+
+**The fix — monkeypatching the module attribute:**
+```python
+# In conftest.py client fixture:
+import app.routers.urls as urls_module
+
+_test_factory = async_sessionmaker(_test_engine, expire_on_commit=False)
+original = urls_module.AsyncSessionLocal
+urls_module.AsyncSessionLocal = _test_factory   # patch
+
+yield ac  # run the test
+
+urls_module.AsyncSessionLocal = original         # restore
+```
+
+**Why this works:** Python module attributes are references. Replacing `urls_module.AsyncSessionLocal` changes what `_record_click` sees when it looks up `AsyncSessionLocal` at call time (not import time). This is a standard monkeypatching technique — the same idea as `unittest.mock.patch`.
+
+**Interview angle:** "How do you test a function that bypasses dependency injection?" → Monkeypatch the module attribute directly. `mock.patch('app.routers.urls.AsyncSessionLocal', new_factory)` or manual save/restore.
+
+---
+
+### 6. pytest-cov + greenlet — why coverage was wrong and how .coveragerc fixed it
+
+**The symptom:** `urls.py` showed 77% coverage even though all 9 tests passed — including tests that clearly exercised the missing lines.
+
+**Root cause — greenlets:**
+- SQLAlchemy's async bridge uses `greenlet` internally. When an `await db.execute(...)` runs, SQLAlchemy switches to a greenlet to handle the synchronous part of the ORM under the hood.
+- By default, `coverage.py` only traces the main Python thread. Code that runs inside a greenlet context switch is **invisible** to coverage — it executes but is never marked as covered.
+
+**Fix — one file:**
+```ini
+# .coveragerc
+[run]
+concurrency = greenlet
+
+[report]
+show_missing = true
+```
+
+**Result:** Coverage jumped from 77% → 94% on `urls.py` and overall from 77% → 94%, then to 89% before analytics tests were added, then back above 94% after.
+
+**Interview angle:** "Why would coverage show a line as uncovered even though the test clearly runs it?" → The code may be executing inside a different concurrency context (greenlet, thread, subprocess) that coverage isn't tracing. Fix with `concurrency = greenlet` or `concurrency = thread` in `.coveragerc` depending on the runtime.
+
+---
+
+**CI (what we built):** Runs on every push and PR. Checks that the code is correct before it merges.
+
+**CD (what comes next):** Runs after code merges to `main`. Ships the code to users.
+
+```
+Push code → CI runs (tests, lint) → PR merges → CD runs (build, deploy)
+```
+
+**CD in GitHub Actions** would be a second job with `if: github.ref == 'refs/heads/main'`:
+```yaml
+- name: Build and push Docker image
+- name: Deploy to server
+- name: Run alembic upgrade head
+```
+
+**Continuous Delivery vs Continuous Deployment:**
+- Delivery: code is automatically *ready* to ship, but a human clicks deploy
+- Deployment: fully automatic, no human step
+
+**Interview angle:** "What's the difference between CI and CD?" → CI validates code before merge. CD ships code after merge. CI is about correctness; CD is about delivery speed.
+
+---
