@@ -29,7 +29,9 @@ class ShortenRequest(BaseModel):
             pass  # hostname, not a bare IP — allow it
         else:
             if addr.is_loopback or addr.is_private or addr.is_link_local:
-                raise ValueError("URLs pointing to private or internal IP addresses are not allowed.")
+                raise ValueError(
+                    "URLs pointing to private or internal IP addresses are not allowed."
+                )
         return v
 
 
