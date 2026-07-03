@@ -12,3 +12,5 @@ tests
 .claude
 docs
 *.md
+frontend
+.venv

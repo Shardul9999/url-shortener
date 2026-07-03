@@ -1,3 +1,4 @@
+import os
 import pytest
 import pytest_asyncio
 import redis.asyncio as redis
@@ -10,8 +11,14 @@ from app.database import Base, get_db
 from app.cache import get_redis
 import app.routers.urls as urls_module
 
-TEST_DATABASE_URL = "postgresql+asyncpg://postgres:password@localhost:5432/urlshortener_test"
-TEST_REDIS_URL = "redis://localhost:6379/1"  # index 1 — separate from dev (index 0)
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://postgres:password@localhost:5432/urlshortener_test",
+)
+TEST_REDIS_URL = os.getenv(
+    "TEST_REDIS_URL",
+    "redis://localhost:6379/1",
+)  # index 1 — separate from dev (index 0)
 
 # NullPool: every connect() creates a fresh connection; no connection is ever
 # returned to a pool. This prevents "Future attached to a different loop" errors
