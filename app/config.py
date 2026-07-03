@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     CACHE_TTL_SECONDS: int = 3600
     # Comma-separated origins, e.g.: https://myapp.com,https://www.myapp.com
     ALLOWED_ORIGINS: str = ""
+    allowed_origins: str = "http://localhost:5173"
 
     @property
     def origins_list(self) -> list[str]:

@@ -10,8 +10,13 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.origins_list,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def root() -> dict:
+    return {"message": "URL Shortener API", "docs": "/docs"}
 
 
 @app.get("/health")
